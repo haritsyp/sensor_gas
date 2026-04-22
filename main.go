@@ -111,6 +111,8 @@ func main() {
 				continue
 			}
 
+			log.Println(results)
+
 			// 3. Parse and Forward Data
 			for i := 0; i < 3; i++ {
 				valRaw := uint16(results[i*2])<<8 | uint16(results[i*2+1])
@@ -120,6 +122,9 @@ func main() {
 				if !ok || deviceID == "" {
 					continue
 				}
+
+				// Log the reading to terminal
+				log.Printf("[DATA] Sensor %d (ID %s): Raw=%d, Float=%.2f", i+1, deviceID, valRaw, valFloat)
 
 				// 4. Forward to API asynchronously (Goroutine)
 				go forwardToAPI(config.APIBaseURL, deviceID, valFloat)
