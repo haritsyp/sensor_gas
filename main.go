@@ -104,19 +104,34 @@ func main() {
 			log.Println("[INFO] Shutting down application...")
 			return
 		case <-ticker.C:
-			// 2. Read 3 Holding Registers starting at 0
+			// 2. Read 3 Holding Registers starting at 0 (%MW0 - %MW2)
 			results, err := client.ReadHoldingRegisters(0, 3)
 			if err != nil {
-				log.Printf("[ERROR] Modbus Read Error: %v", err)
+				log.Printf("[ERROR] Modbus Read Registers Error: %v", err)
 				continue
 			}
 
-			log.Println(results)
+			// 2.1 Read 3 Coils starting at 30 (%M30 - %M32) for Fault status
+			coils, err2 := client.ReadCoils(30, 3)
+			if err2 != nil {
+				log.Printf("[ERROR] Modbus Read Coils Error: %v", err2)
+				continue
+			}
 
 			// 3. Parse and Forward Data
 			for i := 0; i < 3; i++ {
+				// Parse register value
 				valRaw := uint16(results[i*2])<<8 | uint16(results[i*2+1])
 				valFloat := float64(valRaw)
+
+				// Parse fault status (coil)
+				// coils[0] contains the first 8 coils as bits
+				isFault := (coils[0] & (1 << i)) != 0
+				
+				// Logic: if fault detected (kabel putus), send -1 to API
+				if isFault {
+					valFloat = -1.0
+				}
 
 				deviceID, ok := config.DeviceMapping[i]
 				if !ok || deviceID == "" {
@@ -124,7 +139,11 @@ func main() {
 				}
 
 				// Log the reading to terminal
-				log.Printf("[DATA] Sensor %d (ID %s): Raw=%d, Float=%.2f", i+1, deviceID, valRaw, valFloat)
+				if isFault {
+					log.Printf("[FAULT] Sensor %d (ID %s): KABEL PUTUS, sending -1.00", i+1, deviceID)
+				} else {
+					log.Printf("[DATA] Sensor %d (ID %s): Raw=%d, Float=%.2f", i+1, deviceID, valRaw, valFloat)
+				}
 
 				// 4. Forward to API asynchronously (Goroutine)
 				go forwardToAPI(config.APIBaseURL, deviceID, valFloat)
