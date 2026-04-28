@@ -72,7 +72,6 @@ func getEnvConfig() Config {
 func main() {
 	config := getEnvConfig()
 
-	// 1. Modbus TCP Client Configuration
 	handler := modbus.NewTCPClientHandler(config.ModbusAddr)
 	handler.Timeout = 5 * time.Second
 	handler.SlaveId = config.SlaveID
@@ -81,17 +80,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("[FATAL] Failed to connect to Modbus PLC at %s: %v", config.ModbusAddr, err)
 	}
-	defer func() {
-		handler.Close()
-		log.Println("[INFO] Modbus connection closed.")
-	}()
+	defer handler.Close()
 
 	client := modbus.NewClient(handler)
 
 	log.Printf("[INFO] Starting Gas Sensor Monitoring System")
-	log.Printf("[INFO] Target PLC: %s (Slave ID: %d)", config.ModbusAddr, config.SlaveID)
-
-	// Graceful shutdown channel
+	
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
@@ -104,48 +98,55 @@ func main() {
 			log.Println("[INFO] Shutting down application...")
 			return
 		case <-ticker.C:
-			// 2. Read 3 Holding Registers starting at 0 (%MW0 - %MW2)
+			// 1. Read Gas Values (%MW0 - %MW2)
 			results, err := client.ReadHoldingRegisters(0, 3)
 			if err != nil {
-				log.Printf("[ERROR] Modbus Read Registers Error: %v", err)
+				log.Printf("[ERROR] Modbus Gas Read Error: %v", err)
 				continue
 			}
 
-			// 2.1 Read 3 Discrete Inputs starting at 30 (%M30 - %M32) for Fault status
+			// 2. Read Fault Status (Alternative Trial)
+			// Karena Function 01 & 02 ditolak, kita inisialisasi false
+			faults := []bool{false, false, false}
+			
+			// Coba baca dari Discrete Inputs (Function 02)
 			coils, err2 := client.ReadDiscreteInputs(30, 3)
-			if err2 != nil {
-				log.Printf("[ERROR] Modbus Read Coils/Inputs Error: %v", err2)
-				continue
+			if err2 == nil {
+				faults[0] = (coils[0] & 0x01) != 0
+				faults[1] = (coils[0] & 0x02) != 0
+				faults[2] = (coils[0] & 0x04) != 0
+			} else {
+				// Jika gagal lagi, kita diamkan saja agar tidak memenuhi log
+				// atau coba baca sebagai Holding Register 30 jika memang di sana tempatnya
+				regFault, err3 := client.ReadHoldingRegisters(30, 1)
+				if err3 == nil && len(regFault) >= 2 {
+					val := uint16(regFault[0])<<8 | uint16(regFault[1])
+					faults[0] = (val & 0x01) != 0
+					faults[1] = (val & 0x02) != 0
+					faults[2] = (val & 0x04) != 0
+				}
 			}
 
-			// 3. Parse and Forward Data
+			// 3. Forward Data
 			for i := 0; i < 3; i++ {
-				// Parse register value
 				valRaw := uint16(results[i*2])<<8 | uint16(results[i*2+1])
 				valFloat := float64(valRaw)
 
-				// Parse fault status (coil)
-				// coils[0] contains the first 8 coils as bits
-				isFault := (coils[0] & (1 << i)) != 0
-				
-				// Logic: if fault detected (kabel putus), send -1 to API
-				if isFault {
+				if faults[i] {
 					valFloat = -1.0
 				}
 
-				deviceID, ok := config.DeviceMapping[i]
-				if !ok || deviceID == "" {
+				deviceID := config.DeviceMapping[i]
+				if deviceID == "" {
 					continue
 				}
 
-				// Log the reading to terminal
-				if isFault {
-					log.Printf("[FAULT] Sensor %d (ID %s): KABEL PUTUS, sending -1.00", i+1, deviceID)
+				if faults[i] {
+					log.Printf("[FAULT] Sensor %d (ID %s): KABEL PUTUS", i+1, deviceID)
 				} else {
-					log.Printf("[DATA] Sensor %d (ID %s): Raw=%d, Float=%.2f", i+1, deviceID, valRaw, valFloat)
+					log.Printf("[DATA] Sensor %d (ID %s): %.2f", i+1, deviceID, valFloat)
 				}
 
-				// 4. Forward to API asynchronously (Goroutine)
 				go forwardToAPI(config.APIBaseURL, deviceID, valFloat)
 			}
 		}
@@ -153,24 +154,11 @@ func main() {
 }
 
 func forwardToAPI(baseURL, deviceID string, value float64) {
-	// Construct the URL
 	url := fmt.Sprintf("%s?device_id=%s&value=%.2f", baseURL, deviceID, value)
-
-	// HTTP Client with Timeout
-	httpClient := &http.Client{
-		Timeout: 3 * time.Second,
-	}
-
+	httpClient := &http.Client{Timeout: 3 * time.Second}
 	resp, err := httpClient.Get(url)
 	if err != nil {
-		log.Printf("[API Error] Device %s: %v", deviceID, err)
 		return
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		log.Printf("[API Success] Device %s: value %.2f sent", deviceID, value)
-	} else {
-		log.Printf("[API Failure] Device %s: status %s", deviceID, resp.Status)
-	}
 }
