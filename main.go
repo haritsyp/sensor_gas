@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -40,12 +39,16 @@ type Config struct {
 
 func loadDotEnv(filename string) {
 	file, err := os.Open(filename)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if len(line) == 0 || strings.HasPrefix(line, "#") { continue }
+		if len(line) == 0 || strings.HasPrefix(line, "#") {
+			continue
+		}
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
 			os.Setenv(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
@@ -55,13 +58,11 @@ func loadDotEnv(filename string) {
 
 func getEnvConfig() Config {
 	loadDotEnv(".env")
-	
-	// FORCE SLAVE ID 1 karena 247 terbukti gagal/illegal di Modbus TCP
 	sID := 1
-	
 	pollSec, _ := strconv.Atoi(os.Getenv("POLLING_INTERVAL_SECONDS"))
-	if pollSec <= 0 { pollSec = 1 }
-	
+	if pollSec <= 0 {
+		pollSec = 1
+	}
 	return Config{
 		ModbusAddr:      os.Getenv("MODBUS_ADDR"),
 		SlaveID:         byte(sID),
@@ -83,96 +84,106 @@ func main() {
 
 	err := handler.Connect()
 	if err != nil {
-		log.Fatalf("[FATAL] Gagal koneksi ke %s: %v", config.ModbusAddr, err)
+		log.Fatalf("[FATAL] %v", err)
 	}
 	defer handler.Close()
 	client := modbus.NewClient(handler)
 
-	log.Printf("[INFO] Monitoring Aktif | PLC: %s | Slave ID: %d", config.ModbusAddr, config.SlaveID)
+	log.Printf("[INFO] Searching Analog Values (IW0-5 or MW10-20) | Slave ID: %d", config.SlaveID)
 
 	go func() {
 		ticker := time.NewTicker(config.PollingInterval)
 		for range ticker.C {
-			// SCAN MW0 - MW9 (10 register). 20 register menyebabkan exception '3'
-			regs, err := client.ReadHoldingRegisters(0, 10)
-			if err != nil {
-				log.Printf("[ERROR] Modbus Read Error: %v", err)
-				continue
-			}
+			// 1. Ambil Status Fault dari MW0-2 (Holding Register)
+			statusRegs, errS := client.ReadHoldingRegisters(0, 3)
 
-			// Tampilkan scan untuk memverifikasi data
-			var scanResult []string
-			for i := 0; i < 10; i++ {
-				val := uint16(regs[i*2])<<8 | uint16(regs[i*2+1])
-				scanResult = append(scanResult, fmt.Sprintf("MW%d:%d", i, val))
-			}
-			log.Printf("[SCAN] %s", strings.Join(scanResult, " | "))
+			// 2. COBA: Baca Nilai Analog dari Input Register 0 (Function 04)
+			// Schneider M221 terkadang meletakkan %IW di Input Register 0
+			analogRegs, errA := client.ReadInputRegisters(0, 5)
 
-			parseVal := func(b []byte, off int) (float64, bool) {
-				raw := uint16(b[off])<<8 | uint16(b[off+1])
-				// Logika: 0 = Fault (Kabel Putus)
-				if raw == 0 { return 0, true }
-				// Jika raw adalah nilai analog mentah
-				if raw > 1000 {
-					val := (float64(raw) - 4000) / 160.0
-					if val < 0 { val = 0 }
-					if val > 100 { val = 100 }
-					return val, false
+			// 3. ALTERNATIF: Jika IR gagal, scan MW10-15 (Holding Register)
+			var analogData []byte
+			dataSource := "INPUT_REG_0"
+
+			if errA == nil {
+				analogData = analogRegs
+			} else {
+				// Coba baca Holding Register 10 (mungkin nilai analog di-copy ke sini)
+				mwScan, errM := client.ReadHoldingRegisters(10, 5)
+				if errM == nil {
+					analogData = mwScan
+					dataSource = "HOLDING_REG_10"
 				}
-				// Jika raw adalah 1 (Status OK)
-				return float64(raw), false
 			}
 
-			mu.Lock()
-			dataStore.Gas1, dataStore.Fault1 = parseVal(regs, 0)
-			dataStore.Gas2, dataStore.Fault2 = parseVal(regs, 2)
-			dataStore.Gas3, dataStore.Fault3 = parseVal(regs, 4)
-			dataStore.LastUpdate = time.Now().Format("15:04:05")
-			currentData := dataStore
-			mu.Unlock()
+			if errS == nil {
+				mu.Lock()
+				// Update Status Fault
+				dataStore.Fault1 = (uint16(statusRegs[0])<<8 | uint16(statusRegs[1])) == 0
+				dataStore.Fault2 = (uint16(statusRegs[2])<<8 | uint16(statusRegs[3])) == 0
+				dataStore.Fault3 = (uint16(statusRegs[4])<<8 | uint16(statusRegs[5])) == 0
+
+				// Update Nilai Gas (Jika data analog ditemukan)
+				if len(analogData) >= 6 {
+					v1 := uint16(analogData[0])<<8 | uint16(analogData[1])
+					v2 := uint16(analogData[2])<<8 | uint16(analogData[3])
+					v3 := uint16(analogData[4])<<8 | uint16(analogData[5])
+
+					log.Printf("[DEBUG] Source:%s | Raw1:%d | Raw2:%d | Raw3:%d", dataSource, v1, v2, v3)
+
+					// Konversi 4000-20000 ke 0-100% (opsional, jika ingin tetap raw, hapus rumus ini)
+					dataStore.Gas1 = float64(v1)
+					dataStore.Gas2 = float64(v2)
+					dataStore.Gas3 = float64(v3)
+				} else {
+					// Fallback ke status 0/1 jika analog tidak ketemu
+					dataStore.Gas1 = float64(uint16(statusRegs[0])<<8 | uint16(statusRegs[1]))
+					dataStore.Gas2 = float64(uint16(statusRegs[2])<<8 | uint16(statusRegs[3]))
+					dataStore.Gas3 = float64(uint16(statusRegs[4])<<8 | uint16(statusRegs[5]))
+				}
+
+				dataStore.LastUpdate = time.Now().Format("15:04:05")
+				mu.Unlock()
+			}
 
 			// Forward data ke API
+			mu.Lock()
+			current := dataStore
+			mu.Unlock()
+
 			for i := 0; i < 3; i++ {
 				var val float64
 				var f bool
 				var dID string
 				switch i {
-				case 0: val, f, dID = currentData.Gas1, currentData.Fault1, config.DeviceMapping[0]
-				case 1: val, f, dID = currentData.Gas2, currentData.Fault2, config.DeviceMapping[1]
-				case 2: val, f, dID = currentData.Gas3, currentData.Fault3, config.DeviceMapping[2]
+				case 0:
+					val, f, dID = current.Gas1, current.Fault1, config.DeviceMapping[0]
+				case 1:
+					val, f, dID = current.Gas2, current.Fault2, config.DeviceMapping[1]
+				case 2:
+					val, f, dID = current.Gas3, current.Fault3, config.DeviceMapping[2]
 				}
-				if dID == "" { continue }
-				
+				if dID == "" {
+					continue
+				}
+
 				sendVal := val
-				if f { 
-					sendVal = -1.0 
-					log.Printf("[LOG] ID %s: KABEL PUTUS (0)", dID)
-				} else {
-					log.Printf("[LOG] ID %s: %.2f", dID, val)
+				if f {
+					sendVal = -1.0
 				}
 				go forwardToAPI(config.APIBaseURL, dID, sendVal)
 			}
 		}
 	}()
 
-	http.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		mu.Lock()
-		json.NewEncoder(w).Encode(dataStore)
-		mu.Unlock()
-	})
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "<html><body style='background:#1a1a1a;color:white;text-align:center;font-family:sans-serif'><h1>Gas System OK</h1><p>Cek terminal untuk log SCAN.</p></body></html>")
-	})
-
-	log.Printf("[INFO] Dashboard Web: http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	http.ListenAndServe(":8080", nil)
 }
 
 func forwardToAPI(baseURL, deviceID string, value float64) {
 	url := fmt.Sprintf("%s?device_id=%s&value=%.2f", baseURL, deviceID, value)
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(url)
-	if err == nil { resp.Body.Close() }
+	if err == nil {
+		resp.Body.Close()
+	}
 }
