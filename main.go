@@ -40,16 +40,12 @@ type Config struct {
 
 func loadDotEnv(filename string) {
 	file, err := os.Open(filename)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if len(line) == 0 || strings.HasPrefix(line, "#") {
-			continue
-		}
+		if len(line) == 0 || strings.HasPrefix(line, "#") { continue }
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
 			os.Setenv(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
@@ -61,9 +57,7 @@ func getEnvConfig() Config {
 	loadDotEnv(".env")
 	slaveID, _ := strconv.Atoi(os.Getenv("SLAVE_ID"))
 	pollSec, _ := strconv.Atoi(os.Getenv("POLLING_INTERVAL_SECONDS"))
-	if pollSec <= 0 {
-		pollSec = 1
-	}
+	if pollSec <= 0 { pollSec = 1 }
 	return Config{
 		ModbusAddr:      os.Getenv("MODBUS_ADDR"),
 		SlaveID:         byte(slaveID),
@@ -93,77 +87,64 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(config.PollingInterval)
 		for range ticker.C {
-			// 1. Baca Nilai Analog dari %IW1.0 - %IW1.2 (Input Registers 10-12)
-			// Jika alamat 10 salah, coba alamat 0 atau 1
-			analogBytes, errA := client.ReadInputRegisters(10, 3)
-
-			// 2. Baca Status dari %MW0 - %MW2 (Holding Registers 0-2)
-			statusBytes, errS := client.ReadHoldingRegisters(0, 3)
-
-			if errA != nil || errS != nil {
-				log.Printf("[ERROR] Modbus: AnalogErr=%v, StatusErr=%v", errA, errS)
+			// Baca hanya Holding Registers 0-2 (%MW0 - %MW2)
+			regs, err := client.ReadHoldingRegisters(0, 3)
+			if err != nil {
+				log.Printf("[ERROR] Modbus Read Error: %v", err)
 				continue
 			}
 
-			// Parsing Analog (%IW) - Skala 4000-20000 -> 0-100%
-			parseAnalog := func(b []byte, off int) float64 {
-				raw := float64(uint16(b[off])<<8 | uint16(b[off+1]))
-				val := (raw - 4000) / 160.0
-				if val < 0 {
-					val = 0
+			parseVal := func(b []byte, off int) (float64, bool) {
+				raw := uint16(b[off])<<8 | uint16(b[off+1])
+				
+				// 0 = Kabel Putus
+				if raw == 0 {
+					return 0, true
 				}
-				if val > 100 {
-					val = 100
+				
+				// > 1000 = Analog Raw (4000-20000)
+				if raw > 1000 {
+					val := (float64(raw) - 4000) / 160.0
+					if val < 0 { val = 0 }
+					if val > 100 { val = 100 }
+					return val, false
 				}
-				return val
-			}
-
-			// Parsing Status (%MW) - 1=OK, 0=Fault
-			isFault := func(b []byte, off int) bool {
-				return (uint16(b[off])<<8 | uint16(b[off+1])) == 0
+				
+				// 1 = OK (status saja)
+				return float64(raw), false
 			}
 
 			mu.Lock()
-			dataStore.Gas1 = parseAnalog(analogBytes, 0)
-			dataStore.Gas2 = parseAnalog(analogBytes, 2)
-			dataStore.Gas3 = parseAnalog(analogBytes, 4)
-			dataStore.Fault1 = isFault(statusBytes, 0)
-			dataStore.Fault2 = isFault(statusBytes, 2)
-			dataStore.Fault3 = isFault(statusBytes, 4)
+			dataStore.Gas1, dataStore.Fault1 = parseVal(regs, 0)
+			dataStore.Gas2, dataStore.Fault2 = parseVal(regs, 2)
+			dataStore.Gas3, dataStore.Fault3 = parseVal(regs, 4)
 			dataStore.LastUpdate = time.Now().Format("15:04:05")
 			currentData := dataStore
 			mu.Unlock()
 
-			// Forward to API
 			for i := 0; i < 3; i++ {
 				var val float64
 				var f bool
 				var dID string
 				switch i {
-				case 0:
-					val, f, dID = currentData.Gas1, currentData.Fault1, config.DeviceMapping[0]
-				case 1:
-					val, f, dID = currentData.Gas2, currentData.Fault2, config.DeviceMapping[1]
-				case 2:
-					val, f, dID = currentData.Gas3, currentData.Fault3, config.DeviceMapping[2]
+				case 0: val, f, dID = currentData.Gas1, currentData.Fault1, config.DeviceMapping[0]
+				case 1: val, f, dID = currentData.Gas2, currentData.Fault2, config.DeviceMapping[1]
+				case 2: val, f, dID = currentData.Gas3, currentData.Fault3, config.DeviceMapping[2]
 				}
-				if dID == "" {
-					continue
-				}
-
+				if dID == "" { continue }
+				
 				sendVal := val
-				if f {
-					sendVal = -1.0
+				if f { 
+					sendVal = -1.0 
 					log.Printf("[FAULT] Sensor %d (ID %s): KABEL PUTUS", i+1, dID)
 				} else {
-					log.Printf("[DATA] Sensor %d (ID %s): %.2f%%", i+1, dID, val)
+					log.Printf("[DATA] Sensor %d (ID %s): %.2f", i+1, dID, val)
 				}
 				go forwardToAPI(config.APIBaseURL, dID, sendVal)
 			}
 		}
 	}()
 
-	// Web Server
 	http.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		mu.Lock()
@@ -173,11 +154,11 @@ func main() {
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<html><head><title>Dashboard</title><style>body{font-family:sans-serif;background:#1a1a1a;color:white;text-align:center}.card{background:#2d2d2d;padding:20px;margin:10px;display:inline-block;border-radius:10px;width:200px;border-top:5px solid #4CAF50}.card.fault{border-top-color:#f44336}.error{color:#f44336;font-weight:bold}</style></head>
-		<body><h1>Gas Monitoring System</h1><div id="d"></div>
+		<body><h1>Gas Monitoring System (Stable)</h1><div id="d"></div>
 		<script>
 			async function u(){
 				const res=await fetch('/api/data');const d=await res.json();
-				const c=(n,v,f)=>`+"`"+`<div class="card ${f?'fault':''}"><h3>Sensor ${n}</h3><h1>${f?'ERR':v+'%'}</h1><p class="${f?'error':''}">${f?'KABEL PUTUS':'OK'}</p></div>`+"`"+`;
+				const c=(n,v,f)=>` + "`" + `<div class="card ${f?'fault':''}"><h3>Sensor ${n}</h3><h1>${f?'ERR':v}</h1><p class="${f?'error':''}">${f?'KABEL PUTUS':'OK'}</p></div>` + "`" + `;
 				document.getElementById('d').innerHTML=c(1,d.gas1,d.fault1)+c(2,d.gas2,d.fault2)+c(3,d.gas3,d.fault3);
 			}setInterval(u,1000);u();
 		</script></body></html>`)
@@ -191,7 +172,5 @@ func forwardToAPI(baseURL, deviceID string, value float64) {
 	url := fmt.Sprintf("%s?device_id=%s&value=%.2f", baseURL, deviceID, value)
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(url)
-	if err == nil {
-		resp.Body.Close()
-	}
+	if err == nil { resp.Body.Close() }
 }
