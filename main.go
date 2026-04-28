@@ -85,7 +85,7 @@ func main() {
 	client := modbus.NewClient(handler)
 
 	log.Printf("[INFO] Starting Gas Sensor Monitoring System")
-	
+
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
@@ -108,7 +108,7 @@ func main() {
 			// 2. Read Fault Status (Alternative Trial)
 			// Karena Function 01 & 02 ditolak, kita inisialisasi false
 			faults := []bool{false, false, false}
-			
+
 			// Coba baca dari Discrete Inputs (Function 02)
 			coils, err2 := client.ReadDiscreteInputs(30, 3)
 			if err2 == nil {
@@ -155,6 +155,7 @@ func main() {
 
 func forwardToAPI(baseURL, deviceID string, value float64) {
 	url := fmt.Sprintf("%s?device_id=%s&value=%.2f", baseURL, deviceID, value)
+	log.Println(url)
 	httpClient := &http.Client{Timeout: 3 * time.Second}
 	resp, err := httpClient.Get(url)
 	if err != nil {
