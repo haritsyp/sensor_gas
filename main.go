@@ -108,64 +108,56 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(config.PollingInterval)
 		for range ticker.C {
-			// Read Gas Values
+			// Membaca %MW0 - %MW2 (3 register)
 			results, err := client.ReadHoldingRegisters(0, 3)
 			if err != nil {
-				log.Printf("[ERROR] Modbus Gas Read Error: %v", err)
+				log.Printf("[ERROR] Modbus Read Error: %v", err)
 				continue
 			}
 
-			// Read Fault Status
-			faults := []bool{false, false, false}
-			coils, err2 := client.ReadDiscreteInputs(30, 3)
-			if err2 == nil {
-				faults[0] = (coils[0] & 0x01) != 0
-				faults[1] = (coils[0] & 0x02) != 0
-				faults[2] = (coils[0] & 0x04) != 0
-			} else {
-				// Fallback to holding register if function 2 fails
-				regFault, err3 := client.ReadHoldingRegisters(30, 1)
-				if err3 == nil && len(regFault) >= 2 {
-					val := uint16(regFault[0])<<8 | uint16(regFault[1])
-					faults[0] = (val & 0x01) != 0
-					faults[1] = (val & 0x02) != 0
-					faults[2] = (val & 0x04) != 0
-				}
-			}
+			// Parsing nilai register
+			v1 := uint16(results[0])<<8 | uint16(results[1])
+			v2 := uint16(results[2])<<8 | uint16(results[3])
+			v3 := uint16(results[4])<<8 | uint16(results[5])
 
-			// Update Global DataStore
 			mu.Lock()
-			dataStore.Gas1 = float64(uint16(results[0])<<8 | uint16(results[1]))
-			dataStore.Gas2 = float64(uint16(results[2])<<8 | uint16(results[3]))
-			dataStore.Gas3 = float64(uint16(results[4])<<8 | uint16(results[5]))
-			dataStore.Fault1 = faults[0]
-			dataStore.Fault2 = faults[1]
-			dataStore.Fault3 = faults[2]
-			dataStore.LastUpdate = time.Now().Format("15:04:05")
+			// Simpan nilai asli ke datastore
+			dataStore.Gas1 = float64(v1)
+			dataStore.Gas2 = float64(v2)
+			dataStore.Gas3 = float64(v3)
+
+			// Logika Patch: Berdasarkan screenshot, jika %MW = 0 artinya kabel putus (Fault)
+			dataStore.Fault1 = (v1 == 0)
+			dataStore.Fault2 = (v2 == 0)
+			dataStore.Fault3 = (v3 == 0)
 			
-			// Siapkan data untuk dikirim ke API luar
-			currentData := dataStore 
+			dataStore.LastUpdate = time.Now().Format("15:04:05")
+			currentData := dataStore
 			mu.Unlock()
 
-			// Log & Forward (Existing Logic)
+			// Log & Forward ke API
 			for i := 0; i < 3; i++ {
 				var val float64
-				var f bool
+				var isFault bool
 				var dID string
 
-				if i == 0 { val, f, dID = currentData.Gas1, currentData.Fault1, config.DeviceMapping[0] }
-				if i == 1 { val, f, dID = currentData.Gas2, currentData.Fault2, config.DeviceMapping[1] }
-				if i == 2 { val, f, dID = currentData.Gas3, currentData.Fault3, config.DeviceMapping[2] }
+				switch i {
+				case 0: val, isFault, dID = currentData.Gas1, currentData.Fault1, config.DeviceMapping[0]
+				case 1: val, isFault, dID = currentData.Gas2, currentData.Fault2, config.DeviceMapping[1]
+				case 2: val, isFault, dID = currentData.Gas3, currentData.Fault3, config.DeviceMapping[2]
+				}
 
 				if dID == "" { continue }
 
-				if f {
-					val = -1.0
+				// Kirim -1 ke API jika fault
+				sendVal := val
+				if isFault {
+					sendVal = -1.0
 					log.Printf("[FAULT] Sensor %d (ID %s): KABEL PUTUS", i+1, dID)
 				} else {
 					log.Printf("[DATA] Sensor %d (ID %s): %.2f", i+1, dID, val)
 				}
-				go forwardToAPI(config.APIBaseURL, dID, val)
+				go forwardToAPI(config.APIBaseURL, dID, sendVal)
 			}
 		}
 	}()
@@ -199,7 +191,7 @@ func main() {
 				</style>
 			</head>
 			<body>
-				<h1>Gas Monitoring System</h1>
+				<h1>Gas Monitoring System (Patched)</h1>
 				<div id="dashboard" class="container">Loading Dashboard...</div>
 				<div class="footer">Update Terakhir: <span id="time">-</span></div>
 				<script>
@@ -210,7 +202,7 @@ func main() {
 							const createCard = (num, val, fault) => ` + "`" + `
 								<div class="card ${fault ? 'fault' : ''}">
 									<h3>Sensor ${num}</h3>
-									<h1>${val}</h1>
+									<h1>${fault ? 'ERR' : val}</h1>
 									<span class="status ${fault ? 'error' : 'ok'}">${fault ? 'KABEL PUTUS' : 'SISTEM OK'}</span>
 								</div>
 							` + "`" + `;
@@ -230,11 +222,9 @@ func main() {
 		`)
 	})
 
-	// 3. Start Web Server
 	port := ":8080"
 	fmt.Printf("[INFO] Web Server berjalan di http://localhost%s\n", port)
 	
-	// Graceful shutdown support
 	go func() {
 		stopChan := make(chan os.Signal, 1)
 		signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
