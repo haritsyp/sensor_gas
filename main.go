@@ -55,13 +55,16 @@ func loadDotEnv(filename string) {
 
 func getEnvConfig() Config {
 	loadDotEnv(".env")
-	// Kita coba override Slave ID ke 1 jika 247 memberikan hasil 0
-	slaveID := 1
+	// Menggunakan Slave ID 1 sebagai default yang sudah terbukti bekerja
+	sID := 1
+	if envID, err := strconv.Atoi(os.Getenv("SLAVE_ID")); err == nil && envID != 0 {
+		sID = envID
+	}
 	pollSec, _ := strconv.Atoi(os.Getenv("POLLING_INTERVAL_SECONDS"))
 	if pollSec <= 0 { pollSec = 1 }
 	return Config{
 		ModbusAddr:      os.Getenv("MODBUS_ADDR"),
-		SlaveID:         byte(slaveID),
+		SlaveID:         byte(sID),
 		APIBaseURL:      os.Getenv("API_BASE_URL"),
 		PollingInterval: time.Duration(pollSec) * time.Second,
 		DeviceMapping: map[int]string{
@@ -76,57 +79,63 @@ func main() {
 	config := getEnvConfig()
 	handler := modbus.NewTCPClientHandler(config.ModbusAddr)
 	handler.Timeout = 5 * time.Second
-	handler.SlaveId = config.SlaveID // Menggunakan Slave ID 1
+	handler.SlaveId = config.SlaveID
 
 	err := handler.Connect()
 	if err != nil {
-		log.Fatalf("[FATAL] %v", err)
+		log.Fatalf("[FATAL] Gagal koneksi: %v", err)
 	}
 	defer handler.Close()
 	client := modbus.NewClient(handler)
 
-	log.Printf("[INFO] Memulai monitoring dengan Slave ID: %d", config.SlaveID)
+	log.Printf("[INFO] Gas Monitoring Aktif | PLC: %s | Slave ID: %d", config.ModbusAddr, config.SlaveID)
 
 	go func() {
 		ticker := time.NewTicker(config.PollingInterval)
 		for range ticker.C {
-			// SCAN AREA 1: Holding Registers 0-10 (%MW0)
-			regs, err := client.ReadHoldingRegisters(0, 10)
-			if err == nil {
-				var debugStr []string
-				for i := 0; i < 10; i++ {
-					val := uint16(regs[i*2])<<8 | uint16(regs[i*2+1])
-					debugStr = append(debugStr, fmt.Sprintf("MW%d:%d", i, val))
-				}
-				log.Printf("[SCAN ID:%d] %s", config.SlaveID, strings.Join(debugStr, " | "))
-
-				parseVal := func(b []byte, off int) (float64, bool) {
-					raw := uint16(b[off])<<8 | uint16(b[off+1])
-					if raw == 0 { return 0, true }
-					if raw > 1000 {
-						val := (float64(raw) - 4000) / 160.0
-						if val < 0 { val = 0 }
-						if val > 100 { val = 100 }
-						return val, false
-					}
-					return float64(raw), false
-				}
-
-				mu.Lock()
-				dataStore.Gas1, dataStore.Fault1 = parseVal(regs, 0)
-				dataStore.Gas2, dataStore.Fault2 = parseVal(regs, 2)
-				dataStore.Gas3, dataStore.Fault3 = parseVal(regs, 4)
-				dataStore.LastUpdate = time.Now().Format("15:04:05")
-				mu.Unlock()
-			} else {
-				log.Printf("[ERROR] Read Error (ID:%d): %v", config.SlaveID, err)
+			// Baca 20 register untuk mencari nilai analog 20000
+			regs, err := client.ReadHoldingRegisters(0, 20)
+			if err != nil {
+				log.Printf("[ERROR] Modbus Read: %v", err)
+				continue
 			}
-			
-			// Forward ke API jika data tidak kosong
+
+			// Cetak Scan di terminal (bisa dihapus jika sudah normal)
+			var scanResult []string
+			for i := 0; i < 20; i++ {
+				val := uint16(regs[i*2])<<8 | uint16(regs[i*2+1])
+				if val > 0 {
+					scanResult = append(scanResult, fmt.Sprintf("MW%d:%d", i, val))
+				}
+			}
+			if len(scanResult) > 0 {
+				log.Printf("[SCAN] %s", strings.Join(scanResult, " | "))
+			}
+
+			parseVal := func(b []byte, off int) (float64, bool) {
+				raw := uint16(b[off])<<8 | uint16(b[off+1])
+				// Logika: 0 = Fault
+				if raw == 0 { return 0, true }
+				// Jika raw adalah nilai analog (misal 20000)
+				if raw > 1000 {
+					val := (float64(raw) - 4000) / 160.0
+					if val < 0 { val = 0 }
+					if val > 100 { val = 100 }
+					return val, false
+				}
+				// Jika raw adalah 1 (Status OK)
+				return float64(raw), false
+			}
+
 			mu.Lock()
+			dataStore.Gas1, dataStore.Fault1 = parseVal(regs, 0) // MW0
+			dataStore.Gas2, dataStore.Fault2 = parseVal(regs, 2) // MW1
+			dataStore.Gas3, dataStore.Fault3 = parseVal(regs, 4) // MW2
+			dataStore.LastUpdate = time.Now().Format("15:04:05")
 			currentData := dataStore
 			mu.Unlock()
-			
+
+			// Forward data ke API
 			for i := 0; i < 3; i++ {
 				var val float64
 				var f bool
@@ -137,13 +146,20 @@ func main() {
 				case 2: val, f, dID = currentData.Gas3, currentData.Fault3, config.DeviceMapping[2]
 				}
 				if dID == "" { continue }
+				
 				sendVal := val
-				if f { sendVal = -1.0 }
+				if f { 
+					sendVal = -1.0 
+					log.Printf("[LOG] ID %s: KABEL PUTUS", dID)
+				} else {
+					log.Printf("[LOG] ID %s: %.2f", dID, val)
+				}
 				go forwardToAPI(config.APIBaseURL, dID, sendVal)
 			}
 		}
 	}()
 
+	// Endpoint API untuk JSON
 	http.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		mu.Lock()
@@ -151,10 +167,22 @@ func main() {
 		mu.Unlock()
 	})
 
+	// Halaman Dashboard
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Check terminal for [SCAN] logs. Slave ID: %d", config.SlaveID)
+		fmt.Fprintf(w, `<html><head><title>Gas Monitoring</title><style>body{font-family:sans-serif;background:#1a1a1a;color:white;text-align:center}.card{background:#2d2d2d;padding:20px;margin:10px;display:inline-block;border-radius:10px;width:200px;border-top:5px solid #4CAF50}.card.fault{border-top-color:#f44336}h1{font-size:3em}</style></head>
+		<body><h1>Gas Monitoring</h1><div id="d"></div>
+		<script>
+			async function u(){
+				try {
+					const res=await fetch('/api/data');const d=await res.json();
+					const c=(n,v,f)=>` + "`" + `<div class="card ${f?'fault':''}"><h3>Sensor ${n}</h3><h1>${f?'ERR':v}</h1><p style="color:${f?'#f44336':'#4CAF50'}">${f?'KABEL PUTUS':'OK'}</p></div>` + "`" + `;
+					document.getElementById('d').innerHTML=c(1,d.gas1,d.fault1)+c(2,d.gas2,d.fault2)+c(3,d.gas3,d.fault3);
+				} catch(e){}
+			}setInterval(u,1000);u();
+		</script></body></html>`)
 	})
 
+	log.Printf("[INFO] Dashboard: http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
