@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,10 +10,27 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/goburrow/modbus"
+)
+
+// GasData adalah struktur data untuk response API & Dashboard
+type GasData struct {
+	Gas1       float64 `json:"gas1"`
+	Gas2       float64 `json:"gas2"`
+	Gas3       float64 `json:"gas3"`
+	Fault1     bool    `json:"fault1"`
+	Fault2     bool    `json:"fault2"`
+	Fault3     bool    `json:"fault3"`
+	LastUpdate string  `json:"last_update"`
+}
+
+var (
+	dataStore GasData
+	mu        sync.Mutex
 )
 
 // Config holds the application configuration
@@ -86,38 +104,26 @@ func main() {
 
 	log.Printf("[INFO] Starting Gas Sensor Monitoring System")
 
-	stopChan := make(chan os.Signal, 1)
-	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
-
-	ticker := time.NewTicker(config.PollingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-stopChan:
-			log.Println("[INFO] Shutting down application...")
-			return
-		case <-ticker.C:
-			// 1. Read Gas Values (%MW0 - %MW2)
+	// 1. Goroutine untuk Polling Modbus
+	go func() {
+		ticker := time.NewTicker(config.PollingInterval)
+		for range ticker.C {
+			// Read Gas Values
 			results, err := client.ReadHoldingRegisters(0, 3)
 			if err != nil {
 				log.Printf("[ERROR] Modbus Gas Read Error: %v", err)
 				continue
 			}
 
-			// 2. Read Fault Status (Alternative Trial)
-			// Karena Function 01 & 02 ditolak, kita inisialisasi false
+			// Read Fault Status
 			faults := []bool{false, false, false}
-
-			// Coba baca dari Discrete Inputs (Function 02)
 			coils, err2 := client.ReadDiscreteInputs(30, 3)
 			if err2 == nil {
 				faults[0] = (coils[0] & 0x01) != 0
 				faults[1] = (coils[0] & 0x02) != 0
 				faults[2] = (coils[0] & 0x04) != 0
 			} else {
-				// Jika gagal lagi, kita diamkan saja agar tidak memenuhi log
-				// atau coba baca sebagai Holding Register 30 jika memang di sana tempatnya
+				// Fallback to holding register if function 2 fails
 				regFault, err3 := client.ReadHoldingRegisters(30, 1)
 				if err3 == nil && len(regFault) >= 2 {
 					val := uint16(regFault[0])<<8 | uint16(regFault[1])
@@ -127,35 +133,121 @@ func main() {
 				}
 			}
 
-			// 3. Forward Data
+			// Update Global DataStore
+			mu.Lock()
+			dataStore.Gas1 = float64(uint16(results[0])<<8 | uint16(results[1]))
+			dataStore.Gas2 = float64(uint16(results[2])<<8 | uint16(results[3]))
+			dataStore.Gas3 = float64(uint16(results[4])<<8 | uint16(results[5]))
+			dataStore.Fault1 = faults[0]
+			dataStore.Fault2 = faults[1]
+			dataStore.Fault3 = faults[2]
+			dataStore.LastUpdate = time.Now().Format("15:04:05")
+			
+			// Siapkan data untuk dikirim ke API luar
+			currentData := dataStore 
+			mu.Unlock()
+
+			// Log & Forward (Existing Logic)
 			for i := 0; i < 3; i++ {
-				valRaw := uint16(results[i*2])<<8 | uint16(results[i*2+1])
-				valFloat := float64(valRaw)
+				var val float64
+				var f bool
+				var dID string
 
-				if faults[i] {
-					valFloat = -1.0
-				}
+				if i == 0 { val, f, dID = currentData.Gas1, currentData.Fault1, config.DeviceMapping[0] }
+				if i == 1 { val, f, dID = currentData.Gas2, currentData.Fault2, config.DeviceMapping[1] }
+				if i == 2 { val, f, dID = currentData.Gas3, currentData.Fault3, config.DeviceMapping[2] }
 
-				deviceID := config.DeviceMapping[i]
-				if deviceID == "" {
-					continue
-				}
+				if dID == "" { continue }
 
-				if faults[i] {
-					log.Printf("[FAULT] Sensor %d (ID %s): KABEL PUTUS", i+1, deviceID)
+				if f {
+					val = -1.0
+					log.Printf("[FAULT] Sensor %d (ID %s): KABEL PUTUS", i+1, dID)
 				} else {
-					log.Printf("[DATA] Sensor %d (ID %s): %.2f", i+1, deviceID, valFloat)
+					log.Printf("[DATA] Sensor %d (ID %s): %.2f", i+1, dID, val)
 				}
-
-				go forwardToAPI(config.APIBaseURL, deviceID, valFloat)
+				go forwardToAPI(config.APIBaseURL, dID, val)
 			}
 		}
-	}
+	}()
+
+	// 2. Web Server Handlers
+	http.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		mu.Lock()
+		json.NewEncoder(w).Encode(dataStore)
+		mu.Unlock()
+	})
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `
+			<html>
+			<head>
+				<title>Gas Monitoring Dashboard</title>
+				<style>
+					body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; background: #1a1a1a; color: white; }
+					.container { display: flex; justify-content: center; flex-wrap: wrap; margin-top: 50px; }
+					.card { background: #2d2d2d; padding: 25px; margin: 15px; border-radius: 15px; width: 250px; box-shadow: 0 10px 20px rgba(0,0,0,0.5); border-top: 5px solid #4CAF50; }
+					.card.fault { border-top: 5px solid #f44336; }
+					h3 { color: #aaa; margin-bottom: 5px; }
+					h1 { font-size: 3.5em; margin: 10px 0; }
+					.status { font-weight: bold; padding: 5px 10px; border-radius: 5px; }
+					.ok { background: #2e7d32; }
+					.error { background: #c62828; animation: blink 1s infinite; }
+					@keyframes blink { 0%% { opacity: 1; } 50%% { opacity: 0.5; } 100%% { opacity: 1; } }
+					.footer { margin-top: 30px; color: #666; }
+				</style>
+			</head>
+			<body>
+				<h1>Gas Monitoring System</h1>
+				<div id="dashboard" class="container">Loading Dashboard...</div>
+				<div class="footer">Update Terakhir: <span id="time">-</span></div>
+				<script>
+					async function update() {
+						try {
+							const res = await fetch('/api/data');
+							const d = await res.json();
+							const createCard = (num, val, fault) => ` + "`" + `
+								<div class="card ${fault ? 'fault' : ''}">
+									<h3>Sensor ${num}</h3>
+									<h1>${val}</h1>
+									<span class="status ${fault ? 'error' : 'ok'}">${fault ? 'KABEL PUTUS' : 'SISTEM OK'}</span>
+								</div>
+							` + "`" + `;
+							
+							document.getElementById('dashboard').innerHTML = 
+								createCard(1, d.gas1, d.fault1) + 
+								createCard(2, d.gas2, d.fault2) + 
+								createCard(3, d.gas3, d.fault3);
+							document.getElementById('time').innerText = d.last_update;
+						} catch (e) { console.error(e); }
+					}
+					setInterval(update, 1000);
+					update();
+				</script>
+			</body>
+			</html>
+		`)
+	})
+
+	// 3. Start Web Server
+	port := ":8080"
+	fmt.Printf("[INFO] Web Server berjalan di http://localhost%s\n", port)
+	
+	// Graceful shutdown support
+	go func() {
+		stopChan := make(chan os.Signal, 1)
+		signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
+		<-stopChan
+		log.Println("[INFO] Shutting down...")
+		os.Exit(0)
+	}()
+
+	log.Fatal(http.ListenAndServe(port, nil))
 }
 
 func forwardToAPI(baseURL, deviceID string, value float64) {
 	url := fmt.Sprintf("%s?device_id=%s&value=%.2f", baseURL, deviceID, value)
-	log.Println(url)
 	httpClient := &http.Client{Timeout: 3 * time.Second}
 	resp, err := httpClient.Get(url)
 	if err != nil {
