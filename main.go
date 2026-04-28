@@ -111,10 +111,10 @@ func main() {
 				continue
 			}
 
-			// 2.1 Read 3 Coils starting at 30 (%M30 - %M32) for Fault status
-			coils, err2 := client.ReadCoils(30, 3)
+			// 2.1 Read 3 Discrete Inputs starting at 30 (%M30 - %M32) for Fault status
+			coils, err2 := client.ReadDiscreteInputs(30, 3)
 			if err2 != nil {
-				log.Printf("[ERROR] Modbus Read Coils Error: %v", err2)
+				log.Printf("[ERROR] Modbus Read Coils/Inputs Error: %v", err2)
 				continue
 			}
 
