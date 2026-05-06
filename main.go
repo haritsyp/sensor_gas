@@ -20,6 +20,9 @@ type GasData struct {
 	Gas1       float64 `json:"gas1"`
 	Gas2       float64 `json:"gas2"`
 	Gas3       float64 `json:"gas3"`
+	RawGas1    float64 `json:"raw_gas1"`
+	RawGas2    float64 `json:"raw_gas2"`
+	RawGas3    float64 `json:"raw_gas3"`
 	Fault1     bool    `json:"fault1"`
 	Fault2     bool    `json:"fault2"`
 	Fault3     bool    `json:"fault3"`
@@ -93,7 +96,7 @@ func main() {
 
 	err := handler.Connect()
 	if err != nil {
-		log.Fatalf("[FATAL] Gagal koneksi: %v", err)
+		log.Printf("[ERROR] Koneksi awal gagal: %v. Mencoba kembali dalam loop...", err)
 	}
 	defer handler.Close()
 	client := modbus.NewClient(handler)
@@ -106,15 +109,24 @@ func main() {
 			// Membaca MW0 - MW9
 			regs, err := client.ReadHoldingRegisters(0, 3)
 			if err != nil {
-				log.Printf("[ERROR] Modbus Read: %v", err)
+				log.Printf("[ERROR] Modbus Read: %v. Mencoba koneksi ulang...", err)
+
+				// Tutup dan coba koneksi ulang
+				handler.Close()
+				time.Sleep(1 * time.Second) // Jeda singkat sebelum mencoba lagi
+				if errConnect := handler.Connect(); errConnect != nil {
+					log.Printf("[ERROR] Reconnect gagal: %v", errConnect)
+				} else {
+					log.Printf("[INFO] Berhasil terhubung kembali ke PLC")
+				}
 				continue
 			}
 
-			parseVal := func(b []byte, off int) (float64, bool) {
+			parseVal := func(b []byte, off int) (float64, float64, bool) {
 				raw := uint16(b[off])<<8 | uint16(b[off+1])
 				// 0 = Fault (Kabel Putus)
 				if raw == 0 {
-					return 0, true
+					return 0, 0, true
 				}
 				// > 1000 = Analog Raw
 				if raw > 1000 {
@@ -125,16 +137,16 @@ func main() {
 					if val > 100 {
 						val = 100
 					}
-					return val, false
+					return val, float64(raw), false
 				}
 				// 1 = OK (Status saja)
-				return float64(raw), false
+				return -1, float64(raw), false
 			}
 
 			mu.Lock()
-			dataStore.Gas1, dataStore.Fault1 = parseVal(regs, 0)
-			dataStore.Gas2, dataStore.Fault2 = parseVal(regs, 2)
-			dataStore.Gas3, dataStore.Fault3 = parseVal(regs, 4)
+			dataStore.Gas1, dataStore.RawGas1, dataStore.Fault1 = parseVal(regs, 0)
+			dataStore.Gas2, dataStore.RawGas2, dataStore.Fault2 = parseVal(regs, 2)
+			dataStore.Gas3, dataStore.RawGas3, dataStore.Fault3 = parseVal(regs, 4)
 			dataStore.LastUpdate = time.Now().Format("15:04:05")
 			currentData := dataStore
 			mu.Unlock()
