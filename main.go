@@ -128,8 +128,13 @@ func main() {
 				if raw == 0 {
 					return 0, 0, true
 				}
-				// > 1000 = Analog Raw
-				if raw > 1000 {
+
+				if float64(raw) >= 2500 {
+
+					if float64(raw) < 4500 {
+						return 0, float64(raw), false
+					}
+
 					val := (float64(raw) - 4000) / 160.0
 					if val < 0 {
 						val = 0
@@ -137,10 +142,11 @@ func main() {
 					if val > 100 {
 						val = 100
 					}
+
 					return val, float64(raw), false
 				}
-				// 1 = OK (Status saja)
-				return -1, float64(raw), false
+
+				return -1, float64(raw), true
 			}
 
 			mu.Lock()
